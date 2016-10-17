@@ -1,28 +1,134 @@
 
 from pyang import plugin, statements
+import json
+import optparse
+import re
+
+_yang_catalog_index_fd = None
+
 
 def pyang_plugin_init():
     plugin.register_plugin(IndexerPlugin())
 
+
 class IndexerPlugin(plugin.PyangPlugin):
+
     def add_output_format(self, fmts):
         self.multiple_modules = True
         fmts['yang-catalog-index'] = self
+
+    def add_opts(self, optparser):
+        optlist = [
+            optparse.make_option("--yang-index-no-schema",
+                                 dest="yang_index_no_schema",
+                                 action="store_true",
+                                 help="""Do not include SQLite schema in output"""),
+            optparse.make_option("--yang-index-schema-only",
+                                 dest="yang_index_schema_only",
+                                 action="store_true",
+                                 help="""Only include the SQLite schema in output""")
+        ]
+
+        g = optparser.add_option_group("YANG Catalog Index specific options")
+        g.add_options(optlist)
 
     def setup_fmt(self, ctx):
         ctx.implicit_errors = False
 
     def emit(self, ctx, modules, fd):
+        global _yang_catalog_index_fd
+
+        _yang_catalog_index_fd = fd
         emit_index(ctx, modules, fd)
 
-def emit_index(ctx, modules, fd):
-	print "create table yindex(module, path, statement, argument);"
-	for module in modules:
-		for child in module.i_children:
-			statements.iterate_i_children(child, printer)
 
-def printer(stmt):
-	module = stmt.main_module()
-	path = statements.mk_path_str(stmt)
-	print "insert into yindex values('%s', '%s', '%s', '%s');" % (module.arg, path, stmt.keyword, stmt.arg)
-	# print "###", module.arg, path, stmt.keyword, stmt.arg
+def emit_index(ctx, modules, fd):
+    if not ctx.opts.yang_index_no_schema:
+        fd.write(
+            "create table yindex(module, path, statement, argument, description, properties);\n")
+        fd.write(
+            "create table modules(module, belongs_to, namespace, prefix, organization, maturity);\n")
+    if not ctx.opts.yang_index_schema_only:
+        for module in modules:
+            index_mprinter(module)
+            non_chs = module.i_typedefs.values() + module.i_features.values() + module.i_identities.values() + \
+                module.i_groupings.values() + module.i_extensions.values()
+            for nch in non_chs:
+                index_printer(nch)
+            for child in module.i_children:
+                statements.iterate_i_children(child, index_printer)
+
+
+def index_mprinter(module):
+    global _yang_catalog_index_fd
+
+    params = [module.arg]
+    args = ['belongs-to', 'namespace', 'prefix', 'organization']
+    for a in args:
+        nlist = module.search(a)
+        nstr = ''
+        if nlist:
+            nstr = nlist[0].arg
+            nstr = nstr.replace("'", r"''")
+            params.append(nstr)
+        else:
+            params.append('')
+    # Attempt to normalize the organization for catalog retrieval.
+    m = re.search(r"urn:([^:]+):", params[2])
+    if m:
+        params[4] = m.group(1)
+    # We don't yet know the maturity of the module, but we can get that from
+    # the catalog later.
+    _yang_catalog_index_fd.write(
+        "insert into modules values('%s', '%s', '%s', '%s', '%s', '');" % tuple(params) + "\n")
+
+def index_escape_json(s):
+    return s.replace("\\", r"\\").replace("'", r"''").replace("\n", r"\n").replace("\t", r"\t").replace("\"", r"\"")
+
+def index_get_other(stmt):
+    a = stmt.arg
+    if a:
+        a = index_escape_json(a)
+    else:
+        a = ''
+    child = {stmt.keyword: {'value': a, 'has_children': False}}
+    child[stmt.keyword]['children'] = []
+    for ss in stmt.substmts:
+        child[stmt.keyword]['has_children'] = True
+        child[stmt.keyword]['children'].append(index_get_other(ss))
+    return child
+
+
+def index_printer(stmt):
+    global _yang_catalog_index_fd
+
+    if stmt.arg is None:
+        return
+
+    module = stmt.main_module()
+    path = statements.mk_path_str(stmt, True)
+    descr = stmt.search('description')
+    dstr = ''
+    if descr:
+        dstr = descr[0].arg
+        dstr = dstr.replace("'", r"''")
+    subs = []
+    for i in stmt.substmts:
+        a = i.arg
+        k = i.keyword
+
+        if type(i.keyword) is tuple:
+            k = ':'.join(map(str, i.keyword))
+
+        if i.keyword not in statements.data_definition_keywords:
+            subs.append(index_get_other(i))
+        else:
+            has_children = hasattr(i, 'i_children') and len(i.i_children) > 0
+            if not a:
+                a = ''
+            else:
+                a = index_escape_json(a)
+            subs.append(
+                {k: {'value': a, 'has_children': has_children, 'children': []}})
+    _yang_catalog_index_fd.write("insert into yindex values('%s', '%s', '%s', '%s', '%s', '%s');" % (
+        module.arg, path, stmt.keyword, stmt.arg, dstr, json.dumps(subs)) + "\n")
