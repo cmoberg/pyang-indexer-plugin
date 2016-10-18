@@ -26,7 +26,11 @@ class IndexerPlugin(plugin.PyangPlugin):
             optparse.make_option("--yang-index-schema-only",
                                  dest="yang_index_schema_only",
                                  action="store_true",
-                                 help="""Only include the SQLite schema in output""")
+                                 help="""Only include the SQLite schema in output"""),
+            optparse.make_option("--yang-index-make-module-table",
+                                 dest="yang_index_make_module_table",
+                                 action="store_true",
+                                 help="""Generate a modules table that includes various aspects about the modules themselves""")
         ]
 
         g = optparser.add_option_group("YANG Catalog Index specific options")
@@ -46,11 +50,13 @@ def emit_index(ctx, modules, fd):
     if not ctx.opts.yang_index_no_schema:
         fd.write(
             "create table yindex(module, path, statement, argument, description, properties);\n")
-        fd.write(
-            "create table modules(module, belongs_to, namespace, prefix, organization, maturity);\n")
+        if ctx.opts.yang_index_make_module_table:
+            fd.write(
+                "create table modules(module, belongs_to, namespace, prefix, organization, maturity);\n")
     if not ctx.opts.yang_index_schema_only:
         for module in modules:
-            index_mprinter(module)
+            if ctx.opts.yang_index_make_module_table:
+                index_mprinter(module)
             non_chs = module.i_typedefs.values() + module.i_features.values() + module.i_identities.values() + \
                 module.i_groupings.values() + module.i_extensions.values()
             for nch in non_chs:
@@ -82,20 +88,25 @@ def index_mprinter(module):
     _yang_catalog_index_fd.write(
         "insert into modules values('%s', '%s', '%s', '%s', '%s', '');" % tuple(params) + "\n")
 
+
 def index_escape_json(s):
     return s.replace("\\", r"\\").replace("'", r"''").replace("\n", r"\n").replace("\t", r"\t").replace("\"", r"\"")
 
+
 def index_get_other(stmt):
     a = stmt.arg
+    k = stmt.keyword
+    if type(stmt.keyword) is tuple:
+        k = ':'.join(map(str, stmt.keyword))
     if a:
         a = index_escape_json(a)
     else:
         a = ''
-    child = {stmt.keyword: {'value': a, 'has_children': False}}
-    child[stmt.keyword]['children'] = []
+    child = {k: {'value': a, 'has_children': False}}
+    child[k]['children'] = []
     for ss in stmt.substmts:
-        child[stmt.keyword]['has_children'] = True
-        child[stmt.keyword]['children'].append(index_get_other(ss))
+        child[k]['has_children'] = True
+        child[k]['children'].append(index_get_other(ss))
     return child
 
 
